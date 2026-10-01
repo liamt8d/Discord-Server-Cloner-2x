@@ -2,7 +2,9 @@ import { TextBasedChannelTypes, VoiceBasedChannelTypes, ThreadChannelTypes } fro
 import { ChannelPermissionsData } from './';
 
 export interface BaseChannelData {
-    type: TextBasedChannelTypes | VoiceBasedChannelTypes | ThreadChannelTypes;
+    position?: number;
+    type: 'GUILD_MEDIA' | 'GUILD_FORUM' | TextBasedChannelTypes | VoiceBasedChannelTypes | ThreadChannelTypes;
+    id?: string;
     name: string;
     parent?: string;
     permissions: ChannelPermissionsData[];

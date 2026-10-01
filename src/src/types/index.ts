@@ -17,3 +17,6 @@ export * from './TextChannelData';
 export * from './ThreadChannelData';
 export * from './VoiceChannelData';
 export * from './WidgetData';
+export * from './ForumChannelData';
+export * from './CloneEvent';
+export * from './CommunityData';

@@ -1,13 +1,33 @@
 import { DefaultMessageNotificationLevel, ExplicitContentFilterLevel, Snowflake, VerificationLevel } from 'discord.js-selfbot-v13';
+import type { AutoModData, StickerData, WelcomeData, ScheduledEventData, OnboardingData, ScreeningData } from './CommunityData';
 import { AfkData, BanData, ChannelsData, EmojiData, RoleData, WidgetData } from './';
 
 export interface BackupData {
+    purpose?: 'source' | 'destination';
+    excluded?: string[];
+    community?: { rulesChannelId?: string; publicUpdatesChannelId?: string; safetyAlertsChannelId?: string };
+    isCommunity?: boolean;
+    description?: string;
+    preferredLocale?: string;
+    premiumProgressBarEnabled?: boolean;
+    systemChannelId?: string;
+    systemChannelFlags?: string;
+    warnings?: string[];
+    memberRoles?: { userId: string; roleIds: string[] }[];
+    managedRoles?: { id: string; botId?: string; premium?: boolean; name: string }[];
+    autoMod?: AutoModData[];
+    stickers?: StickerData[];
+    welcome?: WelcomeData;
+    scheduledEvents?: ScheduledEventData[];
+    onboarding?: OnboardingData;
+    screening?: ScreeningData;
     name: string;
     iconURL?: string;
     iconBase64?: string;
     verificationLevel: VerificationLevel;
     explicitContentFilter: ExplicitContentFilterLevel;
     defaultMessageNotifications: DefaultMessageNotificationLevel | number;
+    afkTimeout?: number;
     afk?: AfkData;
     widget: WidgetData;
     splashURL?: string;

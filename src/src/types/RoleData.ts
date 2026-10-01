@@ -1,4 +1,7 @@
 export interface RoleData {
+    id?: string;
+    iconURL?: string;
+    unicodeEmoji?: string;
     name: string;
     color: `#${string}`;
     hoist: boolean;

@@ -2,6 +2,9 @@ import { Snowflake, ThreadAutoArchiveDuration, ThreadChannelTypes } from "discor
 import { MessageData } from "./MessageData";
 
 export interface ThreadChannelData {
+    id?: string;
+    appliedTagNames?: string[];
+    invitable?: boolean;
     type: ThreadChannelTypes;
     name: string;
     archived: boolean;

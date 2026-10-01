@@ -1,442 +1,377 @@
 import type {
-    CategoryData,
-    ChannelPermissionsData,
-    CreateOptions,
-    LoadOptions,
-    MessageData,
-    TextChannelData,
-    ThreadChannelData,
-    VoiceChannelData
-} from './types';
-import type {
-    CategoryChannel,
-    ChannelLogsQueryOptions,
-    Collection,
-    Guild,
-    GuildChannelCreateOptions,
-    Message,
-    OverwriteData,
-    Snowflake,
-    TextChannel,
-    VoiceChannel,
-    NewsChannel,
-    PremiumTier,
-    ThreadChannel
+  Guild, GuildChannel, CategoryChannel, TextChannel, NewsChannel, VoiceChannel, StageChannel,
+  ForumChannel, MediaChannel, ThreadChannel, Message, OverwriteData, GuildChannelCreateOptions,
+  DefaultReactionEmoji, WebhookMessageOptions
 } from 'discord.js-selfbot-v13';
-import nodeFetch from 'node-fetch';
-import { configOptions2, t } from '../utils/func'
-const MaxBitratePerTier: Record<PremiumTier, number> = {
-    NONE: 64000,
-    TIER_1: 128000,
-    TIER_2: 256000,
-    TIER_3: 384000
-};
-import gradient from 'gradient-string';
-/**
- * Gets the permissions for a channel
- */
-export function fetchChannelPermissions(channel: TextChannel | VoiceChannel | CategoryChannel | NewsChannel) {
-    const permissions: ChannelPermissionsData[] = [];
+import type {
+  CategoryData, ChannelPermissionsData, CreateOptions, LoadOptions, MessageData,
+  TextChannelData, VoiceChannelData, ForumChannelData, ThreadChannelData, CloneEvent
+} from './types';
+import { configOptions2 } from '../settings';
 
+export type ChannelData = TextChannelData | VoiceChannelData | ForumChannelData;
+const roles = new WeakMap<Guild, Map<string, string>>();
+const channels = new WeakMap<Guild, Map<string, string>>();
+const emojis = new WeakMap<Guild, Map<string, string>>();
+const retained = new WeakMap<Guild, Set<string>>();
+export function emit(options: LoadOptions, event: CloneEvent) { options.onEvent?.(event); }
+export function errorReason(error: unknown): string {
+  const value = error as { code?: number | string; message?: string };
+  const prefix = typeof value?.code === 'number' ? `Discord ${value.code}: ` : value?.code ? `Error ${value.code}: ` : '';
+  return `${prefix}${value?.message ?? String(error)}`;
+}
+export function startRoleRestore(guild: Guild) { roles.set(guild, new Map()); }
+export function startChannelRestore(guild: Guild) { channels.set(guild, new Map()); emojis.set(guild, new Map()); }
+export function rememberRole(guild: Guild, sourceId: string, targetId: string) {
+  if (sourceId) roles.get(guild)?.set(sourceId, targetId);
+}
+export function rememberChannel(guild: Guild, sourceId: string, targetId: string) {
+  if (!channels.has(guild)) channels.set(guild, new Map());
+  if (sourceId) channels.get(guild)?.set(sourceId, targetId);
+}
+export function rememberEmoji(guild: Guild, sourceId: string, targetId: string) {
+  if (!emojis.has(guild)) emojis.set(guild, new Map());
+  if (sourceId) emojis.get(guild)?.set(sourceId, targetId);
+}
+export function resolveRoleId(guild: Guild, id: string): string | undefined {
+  return roles.get(guild)?.get(id) ?? (guild.roles.cache.has(id) ? id : undefined);
+}
+export function resolveChannelId(guild: Guild, id: string): string | undefined {
+  return channels.get(guild)?.get(id) ?? (guild.channels.cache.has(id) ? id : undefined);
+}
+export function resolveEmojiId(guild: Guild, id: string): string | undefined {
+  return emojis.get(guild)?.get(id) ?? (guild.emojis.cache.has(id) ? id : undefined);
+}
+export function resetCommunityRetention(guild: Guild) { retained.delete(guild); }
+export function communityChannelIds(guild: Guild): Set<string> {
+  return new Set([guild.rulesChannelId, guild.publicUpdatesChannelId, guild.safetyAlertsChannelId,
+    ...(retained.get(guild) ?? [])].filter(Boolean));
+}
+
+export function fetchChannelPermissions(channel: GuildChannel): ChannelPermissionsData[] {
+  return Array.from(channel.permissionOverwrites.cache.values()).map((perm) => ({
+    type: perm.type, roleId: perm.type === 'role' ? perm.id : undefined,
+    memberId: perm.type === 'member' ? perm.id : undefined,
+    roleName: channel.guild.roles.cache.get(perm.id)?.name ?? '',
+    allow: perm.allow.bitfield.toString(), deny: perm.deny.bitfield.toString()
+  }));
+}
+async function permissionsFor(data: ChannelPermissionsData[], guild: Guild, options: LoadOptions): Promise<OverwriteData[]> {
+  const result: OverwriteData[] = [];
+  for (const perm of data) {
+    if (perm.type === 'member') {
+      try {
+        await guild.members.fetch(perm.memberId);
+        result.push({ id: perm.memberId, type: 'member', allow: BigInt(perm.allow), deny: BigInt(perm.deny) });
+      } catch (error) {
+        emit(options, { kind: 'skipped', feature: 'permisos de miembro', name: perm.memberId,
+          reason: `El miembro no está disponible en el destino: ${errorReason(error)}` });
+      }
+      continue;
+    }
+    const mapped = perm.roleId && resolveRoleId(guild, perm.roleId);
+    const legacyMatches = !perm.roleId ? guild.roles.cache.filter((r) => r.name === perm.roleName) : undefined;
+    const role = mapped ? guild.roles.cache.get(mapped) : legacyMatches?.size === 1 ? legacyMatches.first() : undefined;
+    if (role) result.push({ id: role.id, type: 'role', allow: BigInt(perm.allow), deny: BigInt(perm.deny) });
+    else emit(options, { kind: 'skipped', feature: 'permisos de rol', name: perm.roleName,
+      reason: 'No hay rol equivalente en el destino (por ejemplo, un rol administrado por un bot).' });
+  }
+  return result;
+}
+
+export async function fetchVoiceChannelData(channel: VoiceChannel | StageChannel): Promise<VoiceChannelData> {
+  return { id: channel.id, type: channel.type, name: channel.name, position: channel.position,
+    parent: channel.parent?.name, bitrate: channel.bitrate, userLimit: channel.userLimit,
+    rtcRegion: channel.rtcRegion, videoQualityMode: channel.videoQualityMode,
+    permissions: fetchChannelPermissions(channel) };
+}
+export async function fetchChannelMessages(channel: TextChannel | NewsChannel | ThreadChannel, options: CreateOptions): Promise<MessageData[]> {
+  const limit = options.maxMessagesPerChannel ?? 100;
+  if (!Number.isInteger(limit) || limit < -1) throw new Error('El límite de mensajes debe ser -1, 0 o un entero positivo.');
+  const result: MessageData[] = [];
+  let before: string;
+  while (limit === -1 || result.length < limit) {
+    const batch = await channel.messages.fetch({ limit: limit === -1 ? 100 : Math.min(100, limit - result.length),
+      ...(before ? { before } : {}) });
+    if (!batch.size || batch.last().id === before) break;
+    before = batch.last().id;
+    options.onProgress?.(`Historial de ${channel.name}: ${result.length + batch.size} mensajes leídos`);
+    for (const message of batch.values()) {
+      if (!message.author || (limit !== -1 && result.length >= limit)) continue;
+      const stickerNames = message.stickers?.size ? Array.from(message.stickers.values()).map((s) => s.name) : [];
+      result.push({ id: message.id, username: message.author.username, avatar: message.author.displayAvatarURL(),
+        content: message.content || (stickerNames.length ? `[Sticker: ${stickerNames.join(', ')}]` : ''),
+        embeds: message.embeds, files: Array.from(message.attachments.values()).map((a) => ({ name: a.name, attachment: a.url })),
+        pinned: message.pinned });
+    }
+  }
+  return result;
+}
+
+export async function fetchThreads(channel: TextChannel | NewsChannel | ForumChannel | MediaChannel, options: CreateOptions): Promise<ThreadChannelData[]> {
+  const found = new Map<string, ThreadChannel>();
+  for (const thread of channel.threads.cache.values()) found.set(thread.id, thread);
+  if (typeof channel.threads.fetchActive === 'function') {
+    for (const archived of [false, true]) {
+      let offset = 0;
+      while (true) {
+        try {
+          const page = await channel.threads.fetchActive(true, { archived, limit: 100, offset });
+          let added = 0;
+          for (const thread of page.threads.values()) {
+            if (!found.has(thread.id)) added++;
+            found.set(thread.id, thread);
+          }
+          if (!page.hasMore || !page.threads.size) break;
+          offset += page.threads.size;
+          // A repeated page should not turn into an endless backup.
+          if (offset > 100 && added === 0) { options.onWarning?.(`Hilos de ${channel.name}: Discord repitió una página.`); break; }
+        } catch (error) {
+          options.onWarning?.(`Hilos ${archived ? 'archivados' : 'activos'} de ${channel.name}: ${errorReason(error)}`);
+          break;
+        }
+      }
+    }
+  }
+  const result: ThreadChannelData[] = [];
+  for (const thread of found.values()) {
     try {
-        /* Debug: Fetching channel permissions */
-        if (configOptions2.Debug) {
-            console.log('[Debug] Fetching channel permissions...');
-        }
-
-        channel.permissionOverwrites.cache
-            .filter((p) => p.type === 'role')
-            .forEach((perm) => {
-                const role = channel.guild.roles.cache.get(perm.id);
-                if (role) {
-                    permissions.push({
-                        roleName: role.name,
-                        allow: perm.allow.bitfield.toString(),
-                        deny: perm.deny.bitfield.toString()
-                    });
-
-                    /* Debug: Permission fetched successfully for role */
-                    if (configOptions2.Debug) {
-                        console.log(`[Debug] Permission fetched successfully for role ${role.name}:`, permissions[permissions.length - 1]);
-                    }
-                }
-            });
-
-        /* Debug: Channel permissions fetched successfully */
-        if (configOptions2.Debug) {
-            console.log('[Debug] Channel permissions fetched successfully:', permissions);
-        }
+      result.push({ id: thread.id, type: thread.type, name: thread.name,
+        archived: thread.archived, locked: thread.locked, invitable: thread.invitable,
+        autoArchiveDuration: thread.autoArchiveDuration, rateLimitPerUser: thread.rateLimitPerUser,
+        appliedTagNames: 'availableTags' in channel ? channel.availableTags.filter((tag) => thread.appliedTags.includes(tag.id)).map((tag) => tag.name) : [],
+        messages: await fetchChannelMessages(thread, options) });
     } catch (error) {
-        console.error(`Error fetching channel permissions for ${channel.name}:`, error);
+      options.onWarning?.(`No se pudo respaldar el hilo ${thread.name}: ${errorReason(error)}`);
     }
-
-    return permissions;
+  }
+  return result;
 }
-
-
-/**
- * Fetches the voice channel data that is necessary for the backup
- */
-export async function fetchVoiceChannelData(channel: VoiceChannel) {
-    return new Promise<VoiceChannelData>(async (resolve) => {
-        let channelData: VoiceChannelData; 
-
-        try {
-            /* Debug: Fetching voice channel data */
-            if (configOptions2.Debug) {
-                console.log('[Debug] Fetching voice channel data...');
-            }
-
-            channelData = {
-                type: 'GUILD_VOICE',
-                name: channel.name,
-                bitrate: channel.bitrate,
-                userLimit: channel.userLimit,
-                parent: channel.parent ? channel.parent.name : null,
-                permissions: fetchChannelPermissions(channel)
-            };
-
-            /* Debug: Voice channel data fetched successfully */
-            if (configOptions2.Debug) {
-                console.log('[Debug] Voice channel data fetched successfully:', channelData);
-            }
-
-            resolve(channelData);
-        } catch (error) {
-            console.error(`Error fetching voice channel data for ${channel.name}:`, error);
-            resolve(channelData);
-        }
-    });
+export async function fetchTextChannelData(channel: TextChannel | NewsChannel, options: CreateOptions): Promise<TextChannelData> {
+  return { id: channel.id, type: channel.type, name: channel.name, position: channel.position,
+    nsfw: channel.nsfw, rateLimitPerUser: channel.rateLimitPerUser, parent: channel.parent?.name,
+    topic: channel.topic, permissions: fetchChannelPermissions(channel),
+    messages: await fetchChannelMessages(channel, options), isNews: channel.type === 'GUILD_NEWS',
+    threads: options.includeThreads === false ? [] : await fetchThreads(channel, options) };
 }
-
-
-export async function fetchChannelMessages (channel: TextChannel | NewsChannel | ThreadChannel, options: CreateOptions): Promise<MessageData[]> {
-    let messages: MessageData[] = [];
-    const messageCount: number = isNaN(options.maxMessagesPerChannel) ? 10 : options.maxMessagesPerChannel;
-    const fetchOptions: ChannelLogsQueryOptions = { limit: 100 };
-    let lastMessageId: Snowflake;
-    let fetchComplete: boolean = false;
-    while (!fetchComplete) {
-        if (lastMessageId) {
-            fetchOptions.before = lastMessageId;
-        }
-        const fetched: Collection<Snowflake, Message> = await channel.messages.fetch(fetchOptions);
-        if (fetched.size === 0) {
-            break;
-        }
-        lastMessageId = fetched.last().id;
-        await Promise.all(fetched.map(async (msg) => {
-            if (!msg.author || messages.length >= messageCount) {
-                fetchComplete = true;
-                return;
-            }
-            const files = await Promise.all(msg.attachments.map(async (a) => {
-                let attach = a.url
-                if (a.url && ['png', 'jpg', 'jpeg', 'jpe', 'jif', 'jfif', 'jfi'].includes(a.url)) {
-                    if (options.saveImages && options.saveImages === 'base64') {
-                        attach = (await (nodeFetch(a.url).then((res) => res.buffer()))).toString('base64')
-                    }
-                }
-                return {
-                    name: a.name,
-                    attachment: attach
-                };
-            }))
-            messages.push({
-                username: msg.author.username,
-                avatar: msg.author.displayAvatarURL(),
-                content: msg.cleanContent,
-                embeds: msg.embeds,
-                files,
-                pinned: msg.pinned
-            });
-        }));
-        return messages;
+export function fetchForumChannelData(channel: ForumChannel | MediaChannel): ForumChannelData {
+  return { id: channel.id, type: channel.type, name: channel.name, position: channel.position,
+    parent: channel.parent?.name, topic: channel.topic ?? undefined, nsfw: channel.nsfw,
+    permissions: fetchChannelPermissions(channel), rateLimitPerUser: channel.rateLimitPerUser ?? undefined,
+    defaultThreadRateLimitPerUser: channel.defaultThreadRateLimitPerUser ?? undefined,
+    defaultAutoArchiveDuration: channel.defaultAutoArchiveDuration ?? undefined,
+    defaultSortOrder: channel.defaultSortOrder ?? undefined,
+    defaultForumLayout: channel.type === 'GUILD_FORUM' ? channel.defaultForumLayout : undefined,
+    defaultReactionEmoji: channel.defaultReactionEmoji ?? undefined,
+    availableTags: channel.availableTags.map((tag) => ({ name: tag.name, moderated: tag.moderated, emoji: tag.emoji })),
+    threads: [] };
+}
+export async function loadCategory(data: CategoryData, guild: Guild, options: LoadOptions = { clearGuildBeforeRestore: true }) {
+  const category = await guild.channels.create(data.name, { type: 'GUILD_CATEGORY', position: data.position });
+  rememberChannel(guild, data.id, category.id);
+  await category.permissionOverwrites.set(await permissionsFor(data.permissions, guild, options));
+  emit(options, { kind: 'copied', feature: 'categorías', name: data.name });
+  return category;
+}
+function portableEmoji(guild: Guild, emoji: DefaultReactionEmoji, options: LoadOptions, name: string): DefaultReactionEmoji | undefined {
+  if (!emoji) return undefined;
+  if (!emoji.id) return emoji;
+  const id = resolveEmojiId(guild, emoji.id);
+  if (id) return { id, name: emoji.name };
+  emit(options, { kind: 'skipped', feature: 'emoji de foro', name, reason: 'No se pudo copiar el emoji personalizado.' });
+  return undefined;
+}
+export async function loadChannel(data: ChannelData, guild: Guild, category?: CategoryChannel,
+  options: LoadOptions = { clearGuildBeforeRestore: true }, existing?: TextChannel) {
+  if (data.name.startsWith('ticket-') && configOptions2.ignoreTickets) {
+    emit(options, { kind: 'skipped', feature: 'canales', name: data.name, reason: 'Ignorar tickets activado.' });
+    return null;
+  }
+  const create: GuildChannelCreateOptions = { type: null, parent: category, position: data.position };
+  if (data.type === 'GUILD_TEXT' || data.type === 'GUILD_NEWS') {
+    const text = data as TextChannelData;
+    Object.assign(create, { topic: text.topic, nsfw: text.nsfw, rateLimitPerUser: text.rateLimitPerUser,
+      type: text.isNews && guild.features.includes('COMMUNITY') ? 'GUILD_NEWS' : 'GUILD_TEXT' });
+    if (text.isNews && create.type === 'GUILD_TEXT') emit(options, { kind: 'skipped', feature: 'tipo anuncio', name: data.name,
+      reason: 'El destino no tiene Comunidad; se crea un canal de texto.' });
+  } else if (data.type === 'GUILD_FORUM' || data.type === 'GUILD_MEDIA') {
+    const forum = data as ForumChannelData;
+    Object.assign(create, { topic: forum.topic, nsfw: forum.nsfw, rateLimitPerUser: forum.rateLimitPerUser });
+    if (guild.features.includes('COMMUNITY')) {
+      create.type = forum.type;
+      create.availableTags = forum.availableTags.map((tag) => ({ ...tag, id: undefined as string,
+        emoji: options.deferForumEmojis ? null : portableEmoji(guild, tag.emoji, options, tag.name) ?? null }));
+      create.defaultThreadRateLimitPerUser = forum.defaultThreadRateLimitPerUser;
+      if (!options.deferForumEmojis) create.defaultReactionEmoji = portableEmoji(guild, forum.defaultReactionEmoji, options, forum.name);
+      create.defaultSortOrder = forum.defaultSortOrder;
+      if (forum.type === 'GUILD_FORUM') create.defaultForumLayout = forum.defaultForumLayout;
+    } else {
+      create.type = 'GUILD_TEXT';
+      emit(options, { kind: 'skipped', feature: 'tipo foro/multimedia', name: forum.name, reason: 'Sin Comunidad; se crea canal de texto con hilos.' });
     }
-} 
-
-/**
- * Fetches the text channel data that is necessary for the backup
- */
-export async function fetchTextChannelData(channel: TextChannel | NewsChannel, options: CreateOptions) {
-    return new Promise<TextChannelData>(async (resolve) => {
-        const channelData: TextChannelData = {
-            type: channel.type,
-            name: channel.name,
-            nsfw: channel.nsfw,
-            rateLimitPerUser: channel.type === 'GUILD_TEXT' ? channel.rateLimitPerUser : undefined,
-            parent: channel.parent ? channel.parent.name : null,
-            topic: channel.topic,
-            permissions: fetchChannelPermissions(channel),
-            messages: [],
-            isNews: channel.type === 'GUILD_NEWS',
-            threads: []
-        };
-
-        // Debugging: Print channel data
-        if (configOptions2.Debug) {
-            console.log('[Debug] Fetching channel data...');
-            console.log(channelData);
-        }
-
-        /* Fetch channel threads */
-        if (channel.threads.cache.size > 0) {
-            if (configOptions2.Debug) {
-                console.log('[Debug] Fetching thread data...');
-            }
-            await Promise.all(channel.threads.cache.map(async (thread) => {
-                const threadData: ThreadChannelData = {
-                    type: thread.type,
-                    name: thread.name,
-                    archived: thread.archived,
-                    autoArchiveDuration: thread.autoArchiveDuration,
-                    locked: thread.locked,
-                    rateLimitPerUser: thread.rateLimitPerUser,
-                    messages: []
-                };
-                try {
-                    threadData.messages = await fetchChannelMessages(thread, options);
-
-                    // Debugging: Print thread data
-                    if (configOptions2.Debug) {
-                        console.log(`[Debug] Fetched ${threadData.messages.length} messages for thread ${thread.name}`);
-                    }
-
-                    channelData.threads.push(threadData);
-                } catch (error) {
-                    console.error(`Error fetching thread messages for ${thread.name}:`, error);
-                    channelData.threads.push(threadData);
-                }
-            }));
-        }
-
-        /* Fetch channel messages */
-        try {
-            if (configOptions2.Debug) {
-                console.log('[Debug] Fetching channel messages...');
-            }
-           
-            if (configOptions2.Debug) {
-                console.log(`[Debug] Fetched ${channelData.messages.length} messages for channel ${channel.name}`);
-            }
-            resolve(channelData);
-        } catch (error) {
-            console.error(`Error fetching channel messages for ${channel.name}:`, error);
-            resolve(channelData);
-        }
-    });
-}
-
-/**
- * Creates a category for the guild
- */
-export async function loadCategory(categoryData: CategoryData, guild: Guild) {
-    return new Promise<CategoryChannel>((resolve) => {
-        guild.channels.create(categoryData.name, {
-            type: 'GUILD_CATEGORY'
-        }).then(async (category) => {
-            // When the category is created
-            const finalPermissions: OverwriteData[] = [];
-            categoryData.permissions.forEach((perm) => {
-                const role = guild.roles.cache.find((r) => r.name === perm.roleName);
-                if (role) {
-                    finalPermissions.push({
-                        id: role.id,
-                        allow: BigInt(perm.allow),
-                        deny: BigInt(perm.deny)
-                    });
-                }
-            });
-            await category.permissionOverwrites.set(finalPermissions);
-            resolve(category); // Return the category
-        });
-    });
-}
-
-/**
- * Create a channel and returns it
- */
-export async function loadChannel(
-    channelData: TextChannelData | VoiceChannelData,
-    guild: Guild,
-    category?: CategoryChannel,
-    options?: LoadOptions
-) {
-    return new Promise(async (resolve) => {
-        if (channelData.name.startsWith("ticket-") && configOptions2.ignoreTickets) {
-            console.log(channelData.name + t('ignoreticketmsg'));
-            return null; 
-        }
-        const loadMessages = (channel: TextChannel | ThreadChannel, messages: MessageData[]): Promise<void> => {
-            return new Promise((resolve) => {
-                (channel as unknown as TextChannel)
-                    .createWebhook('MessagesBackup', {
-                        avatar: channel.client.user.displayAvatarURL()
-                    })
-                    .then(async (webhook) => {
-                        messages = messages
-                            .filter((m) => m.content.length > 0 || m.embeds.length > 0 || m.files.length > 0)
-                            .reverse();
-                        messages = messages.slice(messages.length - options.maxMessagesPerChannel);
-                        for (const msg of messages) {
-                            const sentMsg = await webhook
-                                .send({
-                                    content: msg.content,
-                                    username: msg.username,
-                                    avatarURL: msg.avatar,
-                                    embeds: msg.embeds,
-                                    files: msg.files,
-                                    allowedMentions: options.allowedMentions
-                                })
-                                .catch((err) => {
-                                    console.log(err.message);
-                                });
-                            if (msg.pinned && sentMsg) await (sentMsg as Message).pin();
-                        }
-                        resolve();
-                    })
-                    .catch(() => resolve());
-            });
-        }
-
-        const createOptions: GuildChannelCreateOptions = {
-            type: null,
-            parent: category
-        };
-        if (channelData.type === 'GUILD_TEXT' || channelData.type === 'GUILD_NEWS') {
-            createOptions.topic = (channelData as TextChannelData).topic;
-            createOptions.nsfw = (channelData as TextChannelData).nsfw;
-            createOptions.rateLimitPerUser = (channelData as TextChannelData).rateLimitPerUser;
-            createOptions.type =
-                (channelData as TextChannelData).isNews && guild.features.includes('NEWS') ? 'GUILD_NEWS' : 'GUILD_TEXT';
-        } else if (channelData.type === 'GUILD_VOICE') {
-            // Downgrade bitrate
-            let bitrate = (channelData as VoiceChannelData).bitrate;
-            const bitrates = Object.values(MaxBitratePerTier);
-            while (bitrate > MaxBitratePerTier[guild.premiumTier]) {
-                bitrate = bitrates[Object.keys(MaxBitratePerTier).indexOf(guild.premiumTier) - 1];
-            }
-            createOptions.bitrate = bitrate;
-
-            if ((channelData as VoiceChannelData).userLimit <= 99) {
-                createOptions.userLimit = (channelData as VoiceChannelData).userLimit;
-            }
-        
-            createOptions.type = 'GUILD_VOICE';
-        }
-        guild.channels.create(channelData.name, createOptions).then(async (channel) => {
-            /* Update channel permissions */
-            const finalPermissions: OverwriteData[] = [];
-            channelData.permissions.forEach((perm) => {
-                const role = guild.roles.cache.find((r) => r.name === perm.roleName);
-                if (role) {
-                    finalPermissions.push({
-                        id: role.id,
-                        allow: BigInt(perm.allow),
-                        deny: BigInt(perm.deny)
-                    });
-                }
-            });
-            await channel.permissionOverwrites.set(finalPermissions);
-            if (channelData.type === 'GUILD_TEXT') {
-                /* Load threads */
-                if ((channelData as TextChannelData).threads.length > 0) { //&& guild.features.includes('THREADS_ENABLED')) {
-                    await Promise.all((channelData as TextChannelData).threads.map(async (threadData) => {
-                        return (channel as TextChannel).threads.create({
-                            name: threadData.name,
-                            autoArchiveDuration: threadData.autoArchiveDuration
-                        }).then((thread) => {
-                            return loadMessages(thread, threadData.messages);
-                        });
-                        
-                    }));
-                }
-                if ((channelData as TextChannelData).messages.length > 0) {
-                    await loadMessages(channel as TextChannel, (channelData as TextChannelData).messages).catch(() => {});
-                }
-                
-                console.log(gradient(['#43a1ff', '#8a3ffc', '#3c0080'])(t('textchannelcreate') + channelData.name));
-                return channel;
-            } else {
-                resolve(channel);
-            }
-        });
-    });
-}
-
-/**
- * Delete all roles, all channels, all emojis, etc... of a guild
- */
-export async function clearGuild(guild: Guild) {
-    guild.roles.cache
-        .filter((role) => !role.managed && role.editable && role.id !== guild.id)
-        .forEach(async (role) => {
-            try {
-                await role.delete();
-            } catch (error) {
-                console.error(`Não foi possível excluir o cargo ${role.name}: ${error}`);
-            }
-        });
-    
-    guild.channels.cache.forEach(async (channel) => {
-        try {
-            await channel.delete();
-        } catch (error) {
-            console.error(`Não foi possível excluir o canal ${channel.name}: ${error}`);
-        }
-    });
-    
-    guild.emojis.cache.forEach(async (emoji) => {
-        try {
-            await emoji.delete();
-        } catch (error) {
-            console.error(`Não foi possível excluir o emoji ${emoji.name}: ${error}`);
-        }
-    });
-
-    const webhooks = await guild.fetchWebhooks();
-    webhooks.forEach(async (webhook) => {
-        try {
-            await webhook.delete();
-        } catch (error) {
-            console.error(`Não foi possível excluir o webhook ${webhook.name}: ${error}`);
-        }
-    });
-    
-    const bans = await guild.bans.fetch();
-    bans.forEach(async (ban) => {
-        try {
-            await guild.members.unban(ban.user);
-        } catch (error) {
-            console.error(`Não foi possível desbanir o usuário ${ban.user.username}: ${error}`);
-        }
-    });
-    
-    const integrations = await guild.fetchIntegrations();
-    integrations.forEach(async (integration) => {
-        try {
-            await integration.delete();
-        } catch (error) {
-            console.error(`Não foi possível excluir a integração ${integration.name}: ${error}`);
-        }
-    });
-
-    guild.setAFKChannel(null);
-    guild.setAFKTimeout(60 * 5);
-    guild.setIcon(null);
-    guild.setBanner(null).catch(() => {});
-    guild.setSplash(null).catch(() => {});
-    guild.setDefaultMessageNotifications('ONLY_MENTIONS');
-    guild.setWidgetSettings({
-        enabled: false,
-        channel: null
-    });
-    if (!guild.features.includes('COMMUNITY')) {
-        guild.setExplicitContentFilter('DISABLED');
-        guild.setVerificationLevel('NONE');
+  } else if (data.type === 'GUILD_VOICE' || data.type === 'GUILD_STAGE_VOICE') {
+    const voice = data as VoiceChannelData;
+    const tiers = { NONE: 64000, TIER_1: 128000, TIER_2: 256000, TIER_3: 384000 };
+    create.type = data.type === 'GUILD_STAGE_VOICE' && guild.features.includes('COMMUNITY') ? 'GUILD_STAGE_VOICE' : 'GUILD_VOICE';
+    create.bitrate = Math.min(voice.bitrate, guild.maximumBitrate ?? tiers[guild.premiumTier] ?? 64000);
+    create.userLimit = Math.min(voice.userLimit ?? 0, 99);
+    create.rtcRegion = voice.rtcRegion;
+    if (data.type === 'GUILD_VOICE') create.videoQualityMode = voice.videoQualityMode;
+    if (voice.bitrate > create.bitrate) emit(options, { kind: 'skipped', feature: 'bitrate', name: data.name, reason: 'Ajustado al límite de boosts del destino.' });
+    if (data.type === 'GUILD_STAGE_VOICE' && create.type !== data.type) emit(options, { kind: 'skipped', feature: 'tipo escenario', name: data.name, reason: 'Sin Comunidad; se crea canal de voz.' });
+  } else throw new Error(`Tipo de canal no soportado: ${data.type}`);
+  let channel: GuildChannel;
+  if (existing) channel = await existing.edit({ name: data.name, parent: category ?? null,
+    topic: (data as TextChannelData).topic, nsfw: false, rateLimitPerUser: (data as TextChannelData).rateLimitPerUser });
+  else {
+    try { channel = await guild.channels.create(data.name, create) as GuildChannel; }
+    catch (error) {
+      // Media channels may need a server entitlement. Keep the posts in a forum.
+      if (create.type !== 'GUILD_MEDIA' || ![50035, 50001, 50013, 50024].includes((error as { code?: number }).code)) throw error;
+      create.type = 'GUILD_FORUM';
+      emit(options, { kind: 'skipped', feature: 'tipo multimedia', name: data.name, reason: `Se crea como foro: ${errorReason(error)}` });
+      channel = await guild.channels.create(data.name, create) as GuildChannel;
     }
-    guild.setSystemChannel(null);
-    guild.setSystemChannelFlags(['SUPPRESS_GUILD_REMINDER_NOTIFICATIONS', 'SUPPRESS_JOIN_NOTIFICATIONS', 'SUPPRESS_PREMIUM_SUBSCRIPTIONS']);
-    
-    return;
+  }
+  rememberChannel(guild, data.id, channel.id);
+  if (channel.type === 'GUILD_FORUM' || channel.type === 'GUILD_MEDIA') {
+    const duration = (data as ForumChannelData).defaultAutoArchiveDuration;
+    if (duration) await (channel as ForumChannel).setDefaultAutoArchiveDuration(duration);
+  }
+  await channel.permissionOverwrites.set(await permissionsFor(data.permissions, guild, options));
+  emit(options, { kind: 'copied', feature: 'canales', name: data.name });
+  return channel;
+}
+function remapContent(content: string, guild: Guild): string {
+  return (content ?? '').replace(/<([#]|@&)(\d+)>/g, (original, type, id) => {
+    const mapped = type === '#' ? resolveChannelId(guild, id) : resolveRoleId(guild, id);
+    return mapped ? `<${type}${mapped}>` : original;
+  }).replace(/<(a?):([A-Za-z0-9_]+):(\d+)>/g, (original, animated, name, id) => {
+    const mapped = resolveEmojiId(guild, id);
+    return mapped ? `<${animated}:${name}:${mapped}>` : original;
+  });
+}
+function messagePayload(message: MessageData, guild: Guild, options: LoadOptions): WebhookMessageOptions {
+  return { content: remapContent(message.content, guild) || undefined,
+    username: message.username, avatarURL: message.avatar, embeds: message.embeds ?? [], files: message.files ?? [],
+    allowedMentions: options.allowedMentions ?? { parse: [] } };
+}
+function history(messages: MessageData[], options: LoadOptions) {
+  const limit = options.maxMessagesPerChannel ?? 100;
+  return (limit === -1 ? messages : messages.slice(0, limit)).slice().reverse();
+}
+export async function loadMessages(channel: TextChannel | NewsChannel | ThreadChannel, messages: MessageData[], guild: Guild, options: LoadOptions) {
+  const selected = history(messages ?? [], options);
+  if (!selected.length) return;
+  const parent = channel.isThread() ? channel.parent as TextChannel : channel;
+  const webhook = await parent.createWebhook('Copia de comunidad');
+  let count = 0;
+  try {
+    for (const message of selected) {
+      if (!message.content && !message.embeds?.length && !message.files?.length) continue;
+      try {
+        const sent = await webhook.send({ ...messagePayload(message, guild, options), ...(channel.isThread() ? { threadId: channel.id } : {}) });
+        count++;
+        if (message.pinned) await (await channel.messages.fetch(sent.id)).pin();
+      } catch (error) {
+        emit(options, { kind: 'failed', feature: 'mensaje/adjunto', name: channel.name, reason: errorReason(error) });
+      }
+    }
+  } finally {
+    try { await webhook.delete(); }
+    catch (error) { emit(options, { kind: 'failed', feature: 'limpieza de webhook', name: channel.name, reason: errorReason(error) }); }
+  }
+  emit(options, { kind: 'copied', feature: 'mensajes', name: channel.name, count });
+}
+export async function restoreForumEmojis(guild: Guild, data: ForumChannelData, options: LoadOptions) {
+  const channel = guild.channels.cache.get(resolveChannelId(guild, data.id)) as ForumChannel | MediaChannel;
+  if (!channel || !['GUILD_FORUM', 'GUILD_MEDIA'].includes(channel.type)) return;
+  try {
+    const availableTags = data.availableTags.map((tag, index) => ({ ...tag,
+      id: channel.availableTags[index]?.id,
+      emoji: portableEmoji(guild, tag.emoji, options, tag.name) ?? null }));
+    await channel.edit({ availableTags,
+      defaultReactionEmoji: portableEmoji(guild, data.defaultReactionEmoji, options, data.name) ?? null });
+    emit(options, { kind: 'copied', feature: 'etiquetas de foros', name: data.name });
+  } catch (error) { emit(options, { kind: 'failed', feature: 'etiquetas de foros', name: data.name, reason: errorReason(error) }); }
+}
+export async function restoreChannelHistory(channel: GuildChannel, data: ChannelData, guild: Guild, options: LoadOptions) {
+  if (data.type === 'GUILD_VOICE' || data.type === 'GUILD_STAGE_VOICE') return;
+  const text = data as TextChannelData;
+  if (text.messages?.length) await loadMessages(channel as TextChannel, text.messages, guild, options);
+  for (const source of text.threads ?? []) {
+    try {
+      let thread: ThreadChannel;
+      const forum = channel.type === 'GUILD_FORUM' || channel.type === 'GUILD_MEDIA';
+      const appliedTags = forum ? (channel as ForumChannel).availableTags.filter((tag) => source.appliedTagNames?.includes(tag.name)).map((tag) => tag.id) : [];
+      const selected = history(source.messages ?? [], options);
+      if (forum && selected.length) {
+        const webhook = await (channel as ForumChannel).createWebhook('Copia de publicaciones');
+        try {
+          const first = selected.shift();
+          const sent = await webhook.send({ ...messagePayload(first, guild, options),
+            content: remapContent(first.content, guild) || (!first.embeds?.length && !first.files?.length ? `Publicación: ${source.name}` : undefined),
+            threadName: source.name, appliedTags });
+          const id = (sent as Message).channelId ?? (sent as unknown as { channel_id: string }).channel_id;
+          thread = await guild.channels.fetch(id) as ThreadChannel;
+          if (first.pinned) await (await thread.messages.fetch(sent.id)).pin();
+          emit(options, { kind: 'copied', feature: 'mensajes', name: source.name, count: 1 });
+        } finally { await webhook.delete(); }
+        await loadMessages(thread, selected.slice().reverse(), guild, { ...options, maxMessagesPerChannel: -1 });
+      } else if (forum) {
+        thread = await (channel as ForumChannel).threads.create({ name: source.name,
+          message: { content: `Publicación recreada: ${source.name}`, allowedMentions: { parse: [] } },
+          appliedTags, autoArchiveDuration: source.autoArchiveDuration });
+      } else {
+        const base = { name: source.name, autoArchiveDuration: source.autoArchiveDuration };
+        thread = channel.type === 'GUILD_NEWS'
+          ? await (channel as NewsChannel).threads.create(base)
+          : await (channel as TextChannel).threads.create({ ...base,
+            type: source.type === 'GUILD_PRIVATE_THREAD' ? 'GUILD_PRIVATE_THREAD' : 'GUILD_PUBLIC_THREAD',
+            ...(source.type === 'GUILD_PRIVATE_THREAD' ? { invitable: source.invitable } : {}) });
+        await loadMessages(thread, source.messages, guild, options);
+      }
+      rememberChannel(guild, source.id, thread.id);
+      if (source.rateLimitPerUser) await thread.setRateLimitPerUser(source.rateLimitPerUser);
+      if (source.archived) await thread.setArchived(true);
+      if (source.locked) await thread.setLocked(true);
+      emit(options, { kind: 'copied', feature: 'hilos/publicaciones', name: source.name });
+    } catch (error) { emit(options, { kind: 'failed', feature: 'hilos/publicaciones', name: source.name, reason: errorReason(error) }); }
+  }
+}
+export async function clearGuild(guild: Guild, excluded: string[] = [], options: LoadOptions = { clearGuildBeforeRestore: true }) {
+  if (!excluded.includes('channels')) {
+    await guild.setAFKChannel(null);
+    await guild.setSystemChannel(null);
+    await guild.setWidgetSettings({ enabled: false, channel: null });
+    const protectedIds = communityChannelIds(guild);
+    retained.set(guild, protectedIds);
+    for (const channel of Array.from(guild.channels.cache.values())) {
+      if (protectedIds.has(channel.id)) continue;
+      emit(options, { kind: 'progress', feature: 'limpieza', name: `Canal: ${channel.name ?? channel.id}`, current: 0 });
+      try { await channel.delete(); }
+      catch (error) {
+        if ((error as { code?: number }).code !== 50074) throw error;
+        protectedIds.add(channel.id);
+      }
+    }
+  }
+  for (const role of Array.from(guild.roles.cache.values())) {
+    if (!excluded.includes('roles') && !role.managed && role.id !== guild.id) {
+      if (!role.editable) throw new Error(`No se puede borrar el rol ${role.name}.`);
+      emit(options, { kind: 'progress', feature: 'limpieza', name: `Rol: ${role.name}`, current: 0 });
+      await role.delete();
+    }
+  }
+  const reusable = new Set(Object.values(options.reuseEmojiIds ?? {}));
+  if (!excluded.includes('emojis')) for (const emoji of Array.from(guild.emojis.cache.values())) {
+    if (reusable.has(emoji.id)) continue;
+    if (emoji.managed) {
+      emit(options, { kind: 'skipped', feature: 'limpieza de emojis', name: emoji.name, reason: 'El emoji pertenece a una integración; Discord no permite eliminarlo directamente.' });
+      continue;
+    }
+    emit(options, { kind: 'progress', feature: 'limpieza', name: `Emoji: ${emoji.name}`, current: 0 });
+    await emoji.delete();
+    guild.emojis.cache.delete(emoji.id);
+  }
 }
